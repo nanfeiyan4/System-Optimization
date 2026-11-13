@@ -1,0 +1,565 @@
+diff --git a/bolt/include/bolt/Passes/CacheConflictPadding.h b/bolt/include/bolt/Passes/CacheConflictPadding.h
+new file mode 100644
+index 000000000..ce9ff1723
+--- /dev/null
++++ b/bolt/include/bolt/Passes/CacheConflictPadding.h
+@@ -0,0 +1,38 @@
++//===- bolt/Passes/CacheConflictPadding.h -----------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Declares the CacheConflictPadding pass. The pass shifts hot functions inside
++// their 4KB page so that they do not map to the same L1 instruction cache sets.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef BOLT_PASSES_CACHECONFLICTPADDING_H
++#define BOLT_PASSES_CACHECONFLICTPADDING_H
++
++#include "bolt/Passes/BinaryPasses.h"
++
++namespace llvm {
++namespace bolt {
++
++class CacheConflictPadding : public BinaryFunctionPass {
++public:
++  explicit CacheConflictPadding() : BinaryFunctionPass(false) {}
++
++  const char *getName() const override { return "cache-conflict-padding"; }
++
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
++/// Returns the number of padding bytes that the CacheConflictPadding pass
++/// wants to insert before \p Function, or 0. Consumed by the code emitter.
++size_t getConflictPaddingBefore(const BinaryFunction &Function);
++
++} // namespace bolt
++} // namespace llvm
++
++#endif
+diff --git a/bolt/lib/Core/BinaryEmitter.cpp b/bolt/lib/Core/BinaryEmitter.cpp
+index 1402531e0..12af3a4ce 100644
+--- a/bolt/lib/Core/BinaryEmitter.cpp
++++ b/bolt/lib/Core/BinaryEmitter.cpp
+@@ -11,6 +11,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "bolt/Passes/CacheConflictPadding.h"
+ #include "bolt/Core/BinaryEmitter.h"
+ #include "bolt/Core/BinaryContext.h"
+ #include "bolt/Core/BinaryFunction.h"
+@@ -90,7 +91,10 @@ size_t padFunction(std::map<std::string, size_t> &FunctionPadding,
+ 
+ size_t padFunctionBefore(const BinaryFunction &Function) {
+   static std::map<std::string, size_t> CacheFunctionPadding;
+-  return padFunction(CacheFunctionPadding, FunctionPadBeforeSpec, Function);
++  if (size_t Padding =
++          padFunction(CacheFunctionPadding, FunctionPadBeforeSpec, Function))
++    return Padding;
++  return bolt::getConflictPaddingBefore(Function);
+ }
+ size_t padFunctionAfter(const BinaryFunction &Function) {
+   static std::map<std::string, size_t> CacheFunctionPadding;
+diff --git a/bolt/lib/Passes/CMakeLists.txt b/bolt/lib/Passes/CMakeLists.txt
+index a7514d4be..5e2216a1b 100644
+--- a/bolt/lib/Passes/CMakeLists.txt
++++ b/bolt/lib/Passes/CMakeLists.txt
+@@ -4,6 +4,7 @@ add_llvm_library(LLVMBOLTPasses
+   AllocCombiner.cpp
+   AsmDump.cpp
+   BinaryPasses.cpp
++  CacheConflictPadding.cpp
+   BranchLivenessUtils.cpp
+   CMOVConversion.cpp
+   CacheMetrics.cpp
+diff --git a/bolt/lib/Passes/CacheConflictPadding.cpp b/bolt/lib/Passes/CacheConflictPadding.cpp
+new file mode 100644
+index 000000000..02380ed45
+--- /dev/null
++++ b/bolt/lib/Passes/CacheConflictPadding.cpp
+@@ -0,0 +1,407 @@
++//===- bolt/Passes/CacheConflictPadding.cpp -------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// The L1 instruction cache of current x86 cores is typically 32KB, 8-way,
++// 64B lines, i.e. 64 sets. The set of an address is (Addr >> 6) & 63, which is
++// equal to (Addr % 4096) >> 6: two hot basic blocks conflict iff their start
++// addresses differ by a multiple of 4096.
++//
++// BOLT's layout cost models (ext-tsp, hfsort+, cache metrics) are all based on
++// access distance and never look at set indices. When hot functions are forced
++// to a coarse alignment (e.g. --align-functions=4096 for i-TLB/hugepage
++// friendly layouts), every hot function starts at the same page offset and all
++// their hot code lands on the same handful of sets, causing conflict misses
++// even though the hot working set fits in L1i.
++//
++// This pass estimates the output offsets of functions (the emitter lays
++// functions out in BC.getOutputBinaryFunctions() order, applying per-function
++// alignment and a fixed amount of padding before each function), then assigns
++// a page-internal phase (i.e. padding) to the hottest functions so that the
++// maximum number of hot lines mapping to a single set is minimized.
++//
++//===----------------------------------------------------------------------===//
++
++#include "bolt/Passes/CacheConflictPadding.h"
++#include "bolt/Core/BinaryBasicBlock.h"
++#include "bolt/Core/BinaryContext.h"
++#include "bolt/Core/BinaryFunction.h"
++#include "bolt/Utils/CommandLineOpts.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/MathExtras.h"
++#include <algorithm>
++#include <vector>
++
++using namespace llvm;
++
++namespace opts {
++
++cl::opt<bool> ICacheConflictPad(
++    "icache-conflict-pad",
++    cl::desc("shift hot functions inside their 4KB page to reduce L1i "
++             "set-conflict misses (requires a profile)"),
++    cl::init(false), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICacheSets("icache-sets",
++                             cl::desc("number of sets in the L1i cache"),
++                             cl::init(64), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICacheWays("icache-ways",
++                             cl::desc("associativity of the L1i cache"),
++                             cl::init(8), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICacheLine("icache-line",
++                             cl::desc("line size of the L1i cache"),
++                             cl::init(64), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICachePadBudget(
++    "icache-pad-budget",
++    cl::desc("maximum number of padding bytes before a single function"),
++    cl::init(2048), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICacheTopN(
++    "icache-conflict-topn",
++    cl::desc("number of hottest functions considered for conflict handling"),
++    cl::init(32), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICacheMinConflictRatio(
++    "icache-min-conflict-ratio",
++    cl::desc("estimated over-subscription of the L1i sets, in percent of the "
++             "total capacity, below which the pass does nothing"),
++    cl::init(5), cl::cat(BoltOptCategory));
++
++cl::opt<unsigned> ICacheMaxPadPct(
++    "icache-max-pad-pct",
++    cl::desc("maximum padding introduced by the pass, in percent of the hot "
++             "code size (100 = one page per function on average)"),
++    cl::init(100), cl::cat(BoltOptCategory));
++
++cl::opt<bool> ICacheConflictVerbose(
++    "icache-conflict-verbose",
++    cl::desc("print cache-conflict padding decisions"), cl::init(false),
++    cl::Hidden);
++
++} // namespace opts
++
++namespace llvm {
++namespace bolt {
++
++static DenseMap<const BinaryFunction *, size_t> PaddingBefore;
++
++size_t getConflictPaddingBefore(const BinaryFunction &Function) {
++  auto It = PaddingBefore.find(&Function);
++  return It == PaddingBefore.end() ? 0 : It->second;
++}
++
++namespace {
++
++struct FunctionInfo {
++  BinaryFunction *BF = nullptr;
++  uint64_t Offset = 0;
++  uint64_t Size = 0;
++  uint64_t Count = 0;
++  uint64_t Padding = 0;
++  bool Skip = false;
++};
++
++/// Align \p Offset to \p Alignment only if the required amount of padding does
++/// not exceed \p MaxBytes (0 means no limit). This mirrors the behavior of
++/// MCStreamer::emitCodeAlignment used by the emitter.
++uint64_t alignWithBudget(uint64_t Offset, uint64_t Alignment,
++                         uint64_t MaxBytes) {
++  if (Alignment <= 1)
++    return Offset;
++  const uint64_t Aligned = alignTo(Offset, Alignment);
++  if (MaxBytes && Aligned - Offset > MaxBytes)
++    return Offset;
++  return Aligned;
++}
++
++} // anonymous namespace
++
++Error CacheConflictPadding::runOnFunctions(BinaryContext &BC) {
++  PaddingBefore.clear();
++
++  if (!opts::ICacheConflictPad)
++    return Error::success();
++
++  if (!BC.HasRelocations) {
++    BC.outs() << "BOLT-INFO: cache-conflict-padding skipped: no relocations\n";
++    return Error::success();
++  }
++
++  const unsigned NumSets = std::max(1u, opts::ICacheSets.getValue());
++  const unsigned Ways = std::max(1u, opts::ICacheWays.getValue());
++  const unsigned LineSize = std::max(1u, opts::ICacheLine.getValue());
++  const unsigned TopN = std::max(1u, opts::ICacheTopN.getValue());
++  const uint64_t Budget = opts::ICachePadBudget.getValue();
++
++  BinaryContext::IndependentCodeEmitter Emitter =
++      BC.createIndependentMCCodeEmitter();
++
++  // Collect functions in the exact order in which the emitter will write them
++  // and estimate their output offsets.
++  std::vector<FunctionInfo> Funcs;
++  Funcs.reserve(BC.getOutputBinaryFunctions().size());
++
++  auto estimateSize = [&](BinaryFunction &BF) -> uint64_t {
++    uint64_t Size = 0;
++    for (BinaryBasicBlock &BB : BF) {
++      const uint64_t BBAlign = BB.getAlign().value();
++      if (BBAlign > 1)
++        Size = alignTo(Size, BBAlign);
++      Size += BC.computeCodeSize(BB.begin(), BB.end(), Emitter.MCE.get());
++    }
++    return Size;
++  };
++
++  uint64_t Offset = 0;
++  for (BinaryFunction *BF : BC.getOutputBinaryFunctions()) {
++    if (!BC.shouldEmit(*BF))
++      continue;
++
++    const uint64_t MinAlign = std::max<uint64_t>(1, BF->getMinAlign().value());
++    Offset = alignTo(Offset, MinAlign);
++    const uint16_t MaxAlignBytes = BF->getMaxAlignmentBytes();
++    if (MaxAlignBytes > 0)
++      Offset = alignWithBudget(Offset, BF->getAlign().value(), MaxAlignBytes);
++
++    const uint64_t Size = estimateSize(*BF);
++    if (Size == 0)
++      continue;
++
++    FunctionInfo FI;
++    FI.BF = BF;
++    FI.Offset = Offset;
++    FI.Size = Size;
++    FI.Count = BF->hasValidProfile() ? BF->getKnownExecutionCount() : 0;
++    // Padding is emitted for every fragment of a split function, which would
++    // shift cold code as well. Keep the pass conservative and skip them.
++    FI.Skip = BF->isSplit();
++    Funcs.push_back(FI);
++    Offset += Size;
++  }
++
++  // Hottest functions with a valid profile. Very cold entries carry noise
++  // from the instrumentation and are ignored.
++  uint64_t MaxCount = 0;
++  for (const FunctionInfo &F : Funcs)
++    MaxCount = std::max(MaxCount, F.Count);
++  // Ignore functions that are two orders of magnitude colder than the hottest
++  // one: padding them only wastes space and cannot affect L1i conflicts.
++  const uint64_t CountThreshold = std::max<uint64_t>(1, MaxCount / 10);
++
++  std::vector<size_t> Hot;
++  for (size_t I = 0; I < Funcs.size(); ++I)
++    if (Funcs[I].Count >= CountThreshold && !Funcs[I].Skip)
++      Hot.push_back(I);
++
++  if (Hot.size() < 2) {
++    BC.outs() << "BOLT-INFO: cache-conflict-padding: not enough hot functions "
++              << "(" << Hot.size() << ")\n";
++    return Error::success();
++  }
++
++  // Process the hottest functions first.
++  std::stable_sort(Hot.begin(), Hot.end(), [&](size_t A, size_t B) {
++    return Funcs[A].Count > Funcs[B].Count;
++  });
++  if (Hot.size() > TopN)
++    Hot.resize(TopN);
++
++  auto recomputeOffsets = [&]() {
++    uint64_t O = 0;
++    for (FunctionInfo &F : Funcs) {
++      const uint64_t MinAlign =
++          std::max<uint64_t>(1, F.BF->getMinAlign().value());
++      O = alignTo(O, MinAlign);
++      const uint16_t MaxAlignBytes = F.BF->getMaxAlignmentBytes();
++      if (MaxAlignBytes > 0)
++        O = alignWithBudget(O, F.BF->getAlign().value(), MaxAlignBytes);
++      O += F.Padding;
++      F.Offset = O;
++      O += F.Size;
++    }
++  };
++
++  // Count how many hot lines map to every set. A set can hold at most
++  // --icache-ways lines without conflict misses.
++  auto recomputeLines = [&](std::vector<unsigned> &Lines) {
++    Lines.assign(NumSets, 0);
++    for (size_t I : Hot) {
++      const FunctionInfo &F = Funcs[I];
++      if (F.Size == 0)
++        continue;
++      const uint64_t Start = alignDown(F.Offset, uint64_t(LineSize));
++      for (uint64_t A = Start; A < F.Offset + F.Size; A += LineSize)
++        ++Lines[(A / LineSize) % NumSets];
++    }
++  };
++
++  // Convex objective: the amount by which the sets are over-subscribed.
++  // It is exactly zero when the hot working set fits into the cache.
++  auto objective = [&](const std::vector<unsigned> &Lines) {
++    double Sum = 0.0;
++    for (unsigned V : Lines)
++      if (V > Ways)
++        Sum += double(V - Ways) * double(V - Ways);
++    return Sum;
++  };
++
++  auto maxLoad = [](const std::vector<unsigned> &Lines) {
++    return *std::max_element(Lines.begin(), Lines.end());
++  };
++
++  std::vector<unsigned> Lines;
++
++  recomputeOffsets();
++  recomputeLines(Lines);
++  const double InitialObjective = objective(Lines);
++  const unsigned InitialMax = maxLoad(Lines);
++
++  unsigned Excess = 0;
++  for (unsigned V : Lines)
++    if (V > Ways)
++      Excess += V - Ways;
++  const double Ratio =
++      100.0 * double(Excess) / double(uint64_t(NumSets) * Ways);
++  if (Ratio < double(opts::ICacheMinConflictRatio.getValue())) {
++    BC.outs() << "BOLT-INFO: cache-conflict-padding: L1i over-subscription "
++              << Ratio << "% (max " << InitialMax << " hot lines per set, "
++              << Ways << "-way) is below the threshold, nothing to do\n";
++    return Error::success();
++  }
++
++  // Phase 1: spread the hot functions evenly over the 4KB page. This is the
++  // assignment that the one-at-a-time greedy could never reach, because a
++  // function body typically spans most of the sets of the page.
++  const uint64_t PageSpan = uint64_t(NumSets) * LineSize;
++  for (size_t Rank = 0; Rank < Hot.size(); ++Rank) {
++    FunctionInfo &F = Funcs[Hot[Rank]];
++    const uint64_t Step = std::max<uint64_t>(
++        LineSize, std::max<uint64_t>(1, F.BF->getMinAlign().value()));
++    uint64_t Phase = (PageSpan * Rank) / Hot.size();
++    Phase = (Phase / Step) * Step;
++    F.Padding = std::min<uint64_t>(Phase, Budget);
++  }
++
++  recomputeOffsets();
++  recomputeLines(Lines);
++  double BestObjective = objective(Lines);
++  std::vector<uint64_t> BestPadding(Funcs.size(), 0);
++  for (size_t I : Hot)
++    BestPadding[I] = Funcs[I].Padding;
++
++  // Phase 2: coordinate descent. For every hot function, try all admissible
++  // phases and keep the one that improves the global objective the most.
++  for (unsigned Iter = 0; Iter < 4; ++Iter) {
++    bool Changed = false;
++    for (size_t I : Hot) {
++      FunctionInfo &F = Funcs[I];
++      const uint64_t Step = std::max<uint64_t>(
++          LineSize, std::max<uint64_t>(1, F.BF->getMinAlign().value()));
++      const uint64_t Saved = F.Padding;
++      uint64_t BestLocal = Saved;
++      double BestLocalObjective = BestObjective;
++
++      for (uint64_t P = 0; P <= Budget; P += Step) {
++        if (P == Saved)
++          continue;
++        F.Padding = P;
++        recomputeOffsets();
++        recomputeLines(Lines);
++        const double Cur = objective(Lines);
++        if (Cur < BestLocalObjective - 1e-9) {
++          BestLocalObjective = Cur;
++          BestLocal = P;
++        }
++      }
++
++      F.Padding = BestLocal;
++      if (BestLocal != Saved) {
++        Changed = true;
++        BestObjective = BestLocalObjective;
++        for (size_t J : Hot)
++          BestPadding[J] = Funcs[J].Padding;
++      } else {
++        F.Padding = Saved;
++        recomputeOffsets();
++        recomputeLines(Lines);
++      }
++    }
++    if (!Changed)
++      break;
++  }
++
++  for (size_t I : Hot)
++    Funcs[I].Padding = BestPadding[I];
++  recomputeOffsets();
++  recomputeLines(Lines);
++
++  // Bound the code size cost: if the phases selected by the optimizer exceed
++  // the allowed padding budget, compress them proportionally. The relative
++  // spacing of the functions inside the page is preserved.
++  uint64_t HotBytes = 0;
++  for (size_t I : Hot)
++    HotBytes += Funcs[I].Size;
++  uint64_t SelectedPadding = 0;
++  for (size_t I : Hot)
++    SelectedPadding += Funcs[I].Padding;
++  const uint64_t PadLimit =
++      HotBytes * opts::ICacheMaxPadPct.getValue() / 100;
++  if (PadLimit > 0 && SelectedPadding > PadLimit) {
++    // The cost of spreading N functions over a page is Range*(N-1)/2 bytes,
++    // so the maximum admissible phase follows from the padding limit. Never
++    // spread beyond a single page, since phases wrap around every 4KB.
++    const uint64_t MaxRange =
++        2 * PadLimit / std::max<uint64_t>(1, Hot.size() - 1);
++    const uint64_t Range =
++        std::min<uint64_t>(PageSpan, std::max<uint64_t>(LineSize, MaxRange));
++    for (size_t Rank = 0; Rank < Hot.size(); ++Rank) {
++      FunctionInfo &F = Funcs[Hot[Rank]];
++      const uint64_t Step = std::max<uint64_t>(
++          LineSize, std::max<uint64_t>(1, F.BF->getMinAlign().value()));
++      uint64_t Phase = (Range * Rank) / Hot.size();
++      F.Padding = (Phase / Step) * Step;
++    }
++    if (opts::ICacheConflictVerbose)
++      BC.outs() << "BOLT-INFO: icache-conflict-pad: padding limited to "
++                << PadLimit << " bytes, phases re-spread over " << Range
++                << " bytes\n";
++  }
++
++  recomputeOffsets();
++  recomputeLines(Lines);
++
++  uint64_t TotalPadding = 0;
++  size_t NumPadded = 0;
++  for (size_t I : Hot) {
++    const FunctionInfo &F = Funcs[I];
++    if (F.Padding == 0)
++      continue;
++    ++NumPadded;
++    TotalPadding += F.Padding;
++    if (opts::ICacheConflictVerbose)
++      BC.outs() << "BOLT-INFO: icache-conflict-pad: padding " << F.Padding
++                << " bytes before " << *F.BF << " (count " << F.Count << ")\n";
++  }
++
++  BC.outs() << "BOLT-INFO: cache-conflict-padding: considered " << Hot.size()
++            << " hot function(s), padded " << NumPadded << " with "
++            << TotalPadding << " bytes; max hot lines per set " << InitialMax
++            << " -> " << maxLoad(Lines) << " (" << Ways << "-way)\n";
++
++  for (FunctionInfo &F : Funcs)
++    if (F.Padding > 0)
++      PaddingBefore[F.BF] = F.Padding;
++
++  return Error::success();
++}
++
++} // namespace bolt
++} // namespace llvm
+diff --git a/bolt/lib/Rewrite/BinaryPassManager.cpp b/bolt/lib/Rewrite/BinaryPassManager.cpp
+index 3d77ff10e..1c8e02929 100644
+--- a/bolt/lib/Rewrite/BinaryPassManager.cpp
++++ b/bolt/lib/Rewrite/BinaryPassManager.cpp
+@@ -9,6 +9,7 @@
+ #include "bolt/Rewrite/BinaryPassManager.h"
+ #include "bolt/Passes/AArch64RelaxationPass.h"
+ #include "bolt/Passes/Aligner.h"
++#include "bolt/Passes/CacheConflictPadding.h"
+ #include "bolt/Passes/AllocCombiner.h"
+ #include "bolt/Passes/AsmDump.h"
+ #include "bolt/Passes/CMOVConversion.h"
+@@ -557,6 +558,10 @@ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
+     Manager.registerPass(std::make_unique<RISCVLongJmpPass>(PrintLongJmp));
+ 
+   // This pass should always run last.*
++  // Reduce L1i set-conflict misses by shifting hot functions inside
++  // their 4KB page. No-op unless --icache-conflict-pad is given.
++  Manager.registerPass(std::make_unique<CacheConflictPadding>());
++
+   Manager.registerPass(std::make_unique<FinalizeFunctions>(PrintFinalized));
+ 
+   // FrameOptimizer has an implicit dependency on FinalizeFunctions.
+diff --git a/bolt/test/X86/icache-conflict-pad.c b/bolt/test/X86/icache-conflict-pad.c
+new file mode 100644
+index 000000000..9f9944514
+--- /dev/null
++++ b/bolt/test/X86/icache-conflict-pad.c
+@@ -0,0 +1,43 @@
++// Check that the L1i conflict padding pass never changes the output when there
++// is no profile, i.e. when no hot code can be spread over the cache sets.
++//
++// RUN: %clang %cflags -O2 -Wl,--emit-relocs -o %t.exe %s
++// RUN: llvm-bolt %t.exe -o %t.ref --no-huge-pages > /dev/null 2>&1
++// RUN: llvm-bolt %t.exe -o %t.pad --no-huge-pages --icache-conflict-pad 2>&1 | FileCheck %s --check-prefix=NOOP
++// RUN: llvm-objcopy --dump-section=.text=%t.ref.text %t.ref
++// RUN: llvm-objcopy --dump-section=.text=%t.pad.text %t.pad
++// RUN: cmp %t.ref.text %t.pad.text
++//
++// RUN: llvm-bolt --help | FileCheck %s --check-prefix=HELP
++
++// HELP-DAG: --icache-conflict-pad
++// HELP-DAG: --icache-sets
++// HELP-DAG: --icache-ways
++// HELP-DAG: --icache-line
++// HELP-DAG: --icache-pad-budget
++// HELP-DAG: --icache-min-conflict-ratio
++// HELP-DAG: --icache-max-pad-pct
++
++// NOOP: BOLT-INFO: cache-conflict-padding: not enough hot functions
++
++volatile long sink;
++
++__attribute__((noinline)) long f0(long s) {
++  for (int i = 0; i < 64; i++)
++    s = s * 3 + i;
++  return s;
++}
++
++__attribute__((noinline)) long f1(long s) {
++  for (int i = 0; i < 64; i++)
++    s ^= s >> 5;
++  return s;
++}
++
++int main(void) {
++  long r = 1;
++  for (int i = 0; i < 100; i++)
++    r += f0(i) + f1(i);
++  sink = r;
++  return 0;
++}
