@@ -88,7 +88,7 @@ The microbenchmarks are adversarial by construction, so the same experiment was
 repeated on a real program (Ubuntu source package, rebuilt with
 -LDFLAGS=-Wl,--emit-relocs): a 40k-row table with two indexes, an 8k-row joined
 table and 3000 mixed SQL statements (index range scans, point lookups,
-aggregates, joins, LIKE prefixes). See real-workload/ for the exact recipe (SQLite and RapidJSON).
+aggregates, joins, LIKE prefixes). See real-workload/ for the exact recipe (SQLite, RapidJSON and CPython).
 
 | build | I1 misses (40 stmts) | binary size |
 |---|---:|---:|
@@ -137,6 +137,48 @@ not significant, while the binary grows 37%.
 Even a template-heavy program tops out at 5 hot lines per set; the
 microbenchmark reaches 10 only because it builds ten equal-sized page-aligned
 hot bodies executed in a tight round-robin.
+
+## Third real workload: CPython 3.11.9
+
+The third shape: a large binary dominated by one huge interpreter function
+(tens of KB) plus many small helpers, i.e. the "large hot region" case.
+Built from the CPython tarball with -LDFLAGS=-Wl,--emit-relocs; workload is
+300k dict operations plus 60k-element list/string processing (~140 ms),
+profiled with BOLT instrumentation (1.5 MB of profile data).
+
+| build | size |
+|---|---:|
+| original ./python | 41,246,784 |
+| BOLT, default packing | 7,936,560 |
+| BOLT, forced 4KB alignment | 8,018,528 |
+| the same + --icache-conflict-pad | 8,018,560 |
+
+The pass reports
+
+    cache-conflict-padding: L1i over-subscription 0.000000e+00%
+    (max 4 hot lines per set, 8-way) is below the threshold, nothing to do
+
+and the .text of the two forced-4KB builds is byte-identical
+(sha256 462dfa72...); no timing comparison is meaningful because the code is
+the same.
+
+A hot function larger than 4KB wraps around all 64 sets as it runs, so it
+spreads its lines instead of piling them up. Conflicts need *many* hot
+functions starting at the same page offset.
+
+### Summary of the real-workload evidence
+
+| program | shape | max hot lines per set | pass |
+|---|---|---:|---|
+| SQLite 3.37.2 | many small hot functions, spread out | 2 | no-op |
+| RapidJSON | template heavy, similarly sized functions | 5 | no-op |
+| CPython 3.11.9 | one huge hot function + helpers | 4 | no-op |
+
+None of them reaches the 8-way associativity. The pigeonhole argument explains
+why: a hot working set that fits in L1i averages at most 8 lines per set, so
+over-subscription requires a *clustered* layout, which real code only gets when
+hot functions are artificially aligned to page boundaries - exactly what the
+microbenchmark does.
 
 ## Limitations
 * Hardware counters are unavailable on this VM, so miss counts come from

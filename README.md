@@ -12,7 +12,7 @@
 | `DESIGN.md` | 设计文档：问题、算法、选项、无回退证明、测试、实测、局限性 |
 | `docker/` | 可复现实验镜像：Dockerfile + 一键脚本 + 两个负载 |
 | `docker/out/report.md` | 容器内实际跑出的实验报告 |
-| `real-workload/` | 真实负载（SQLite 3.37.2）对照实验的配方与结果 |
+| `real-workload/` | 真实负载对照实验的配方与结果（SQLite 3.37.2、RapidJSON、CPython 3.11.9） |
 
 ## 补丁内容
 
