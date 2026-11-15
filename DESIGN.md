@@ -82,6 +82,35 @@ becomes CPU time on workloads with non-sequential fetch. With straight-line
 hot code the instruction prefetcher hides the misses and the pass correctly
 detects that padding cannot pay for itself.
 
+## Real workload: SQLite 3.37.2
+
+The microbenchmarks are adversarial by construction, so the same experiment was
+repeated on a real program (Ubuntu source package, rebuilt with
+-LDFLAGS=-Wl,--emit-relocs): a 40k-row table with two indexes, an 8k-row joined
+table and 3000 mixed SQL statements (index range scans, point lookups,
+aggregates, joins, LIKE prefixes). See real-workload/ for the exact recipe.
+
+| build | I1 misses (40 stmts) | binary size |
+|---|---:|---:|
+| BOLT, default packing | 51,135 | 2,155,696 |
+| BOLT, forced 4KB alignment | 52,082 | 2,201,024 |
+| the same + --icache-conflict-pad | 52,082 | 2,201,056 |
+
+The pass reports
+
+    cache-conflict-padding: L1i over-subscription 0.000000e+00%
+    (max 2 hot lines per set, 8-way) is below the threshold, nothing to do
+
+and the .text sections of the two forced-4KB builds are byte-identical, so the
+option is a true no-op on this workload. Timing (20 paired ABBA rounds, CPU
+time): default packing vs forced 4KB = -0.56%, 95% CI [-2.58%, +1.46%], not
+significant, while the binary grows by 8%.
+
+Why no conflict: 438 of 2050 functions (21.4%) are profiled and spread over the
+whole binary; each is small, so at most 2 hot lines land on any L1i set, far
+below the 8-way associativity. Real code does not have the "many equal-sized,
+page-aligned hot bodies" shape that the microbenchmark builds on purpose.
+
 ## Limitations
 * Hardware counters are unavailable on this VM, so miss counts come from
   cachegrind simulation; wall-clock gains are small and need CPU-time metrics.
