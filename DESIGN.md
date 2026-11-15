@@ -88,7 +88,7 @@ The microbenchmarks are adversarial by construction, so the same experiment was
 repeated on a real program (Ubuntu source package, rebuilt with
 -LDFLAGS=-Wl,--emit-relocs): a 40k-row table with two indexes, an 8k-row joined
 table and 3000 mixed SQL statements (index range scans, point lookups,
-aggregates, joins, LIKE prefixes). See real-workload/ for the exact recipe.
+aggregates, joins, LIKE prefixes). See real-workload/ for the exact recipe (SQLite and RapidJSON).
 
 | build | I1 misses (40 stmts) | binary size |
 |---|---:|---:|
@@ -110,6 +110,33 @@ Why no conflict: 438 of 2050 functions (21.4%) are profiled and spread over the
 whole binary; each is small, so at most 2 hot lines land on any L1i set, far
 below the 8-way associativity. Real code does not have the "many equal-sized,
 page-aligned hot bodies" shape that the microbenchmark builds on purpose.
+
+## Second real workload: RapidJSON (template heavy)
+
+A shape that could plausibly conflict on real code: `-O2` inlining plus
+template instantiation yields many similarly sized functions, and forcing 4KB
+alignment puts them all at page offset 0. Workload: parse a 2000-object JSON
+document and serialise it back, 300 rounds (~0.65s), profiled with BOLT
+instrumentation.
+
+| build | I1 misses | size |
+|---|---:|---:|
+| BOLT, default packing | 2,170 | 122,976 |
+| BOLT, forced 4KB alignment | 2,226 | 131,440 |
+| the same + --icache-conflict-pad | 2,226 | 131,456 |
+
+The pass reports
+
+    cache-conflict-padding: L1i over-subscription 0.000000e+00%
+    (max 5 hot lines per set, 8-way) is below the threshold, nothing to do
+
+and the .text of the two forced-4KB builds is byte-identical. Timing (15 paired
+ABBA rounds, CPU time): default vs forced 4KB = -1.64%, 95% CI [-4.44%, +1.15%],
+not significant, while the binary grows 37%.
+
+Even a template-heavy program tops out at 5 hot lines per set; the
+microbenchmark reaches 10 only because it builds ten equal-sized page-aligned
+hot bodies executed in a tight round-robin.
 
 ## Limitations
 * Hardware counters are unavailable on this VM, so miss counts come from
