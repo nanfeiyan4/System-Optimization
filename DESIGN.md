@@ -180,6 +180,63 @@ over-subscription requires a *clustered* layout, which real code only gets when
 hot functions are artificially aligned to page boundaries - exactly what the
 microbenchmark does.
 
+## Directions evaluated and rejected
+
+Before settling on the L1i conflict pass we evaluated two other post-link
+optimizations that look attractive on paper. Both were measured on real
+binaries before any implementation work, and both turned out to have no
+exploitable opportunity.
+
+### A. Folding `call f; ret` into `jmp f` (post-link tail calls)
+
+BOLT has no such pass. Its "tail call" is a `jmp` to another function
+(`convertJmpToTailCall`), and `SimplifyConditionalTailCalls` only rewrites
+`jcc` patterns. The opportunity was measured by disassembling the binaries and
+looking for a `call` followed by a return, either immediately or with only
+epilogue instructions (`pop` / `leave` / `nop` / `add $imm,%rsp`) in between.
+
+| binary | instructions | `call; ret` | `call; epilogue; ret` | share |
+|---|---:|---:|---:|---:|
+| sqlite3 -O2 | 268,252 | 0 | 158 | 0.059% |
+| RapidJSON -O2 | 7,167 | 0 | 2 | 0.028% |
+| CPython 3.11.9 | 515,040 | 0 | 481 | 0.093% |
+| sqlite3 -O0 (upper bound) | 255,662 | 0 | 1,419 | 0.555% |
+
+Strict adjacency never occurs, because the epilogue always sits between the
+call and the return, and even converting every relaxed site would remove at
+most 0.06-0.09% of executed instructions, which is below measurement noise.
+Rejected.
+
+### B. Cold basic block deduplication
+
+BOLT only folds whole functions (`--icf`); `--split-functions` merely moves cold
+blocks to `.text.cold` without merging them. We built a read-only scanner pass
+on top of BOLT's real CFG (a temporary `--dedup-report` pass, not part of this
+patch) that fingerprints every cold block - annotations stripped, symbol
+operands compared by name, successor blocks by their layout index, blocks
+without successors mergeable across functions - and reports byte-identical
+duplicates:
+
+| binary | cold blocks | candidates (bytes) | duplicate groups | duplicate blocks | removable |
+|---|---:|---:|---:|---:|---:|
+| sqlite3 3.37.2 | 2,479 | 2,163 (39,466) | 4 | 15 | 58 B |
+| RapidJSON | 347 | 311 (5,783) | 0 | 0 | 0 B |
+| CPython 3.11.9 | 6,837 | 5,794 (86,916) | 32 | 93 | 607 B |
+
+That is 58 bytes in a 2 MB binary and 607 bytes in a 42 MB binary. A naive
+static scan had suggested 5-15% of `.text` was duplicated; that estimate was
+wrong because it also counted hot code (merging a hot block adds a jump on the
+hot path), NOP alignment padding, and blocks that differ only in immediates.
+Rejected.
+
+### What this says about the chosen direction
+
+Both rejected directions are *mechanical* clean-ups, and the compiler plus
+BOLT's existing ICF and splitting already removed almost all of them. The
+remaining opportunity in real binaries is small enough to be invisible, which
+is the same reason the conflict pass only pays off on pathological layouts:
+there is little low-hanging fruit left for a post-link optimizer to pick.
+
 ## Limitations
 * Hardware counters are unavailable on this VM, so miss counts come from
   cachegrind simulation; wall-clock gains are small and need CPU-time metrics.
